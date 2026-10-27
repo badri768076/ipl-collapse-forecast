@@ -1,0 +1,9 @@
+data/*
+!data/.gitkeep
+*.Rhistory
+.Rproj.user/
+.RData
+IDS_CS.html
+IDS_CS.pdf
+*_cache/
+*_files/

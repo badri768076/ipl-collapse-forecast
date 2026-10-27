@@ -1,0 +1,343 @@
+---
+title: "IPL Score Forecasting & Batting-Collapse Detection using Machine Learning in R"
+subtitle: "Introduction to Data Science (IDS) — Case Study"
+author: "A Badri | Roll No: 160124771305 | Branch: AI & DS | Section: I1"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  data_dir: "data"          # folder holding the Cricsheet IPL JSON files (e.g. 335982.json)
+  seed: 123
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 7, fig.height = 4)
+pkgs <- c("jsonlite", "dplyr", "tidyr", "ggplot2", "caret", "randomForest",
+          "glmnet", "gbm", "pROC", "knitr")
+miss <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+if (length(miss)) install.packages(miss, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+source("R/functions.R")
+dir.create("figures", showWarnings = FALSE)
+dir.create("models",  showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 12))
+pal <- c(green = "#0B3D2E", red = "#E4572E", gold = "#F2C14E", grey = "#6B7280")
+save_fig <- function(p, name) ggsave(file.path("figures", name), p, width = 8, height = 4.5, dpi = 200)
+```
+
+# Problem Statement
+
+In T20 cricket a simple run-rate projection (`current run rate × 20`) ignores *how* the
+runs and wickets were produced. Two innings that are both 80/2 after 10 overs can end
+at 150 or 190 depending on the batting depth, the recent momentum and — most importantly —
+whether a **collapse** is under way. This case study builds two data-science models from
+official ball-by-ball IPL data:
+
+1. **Score forecaster (regression)** — expected final first-innings score at 6, 10, 15 and 18 overs.
+2. **Collapse detector (classification)** — probability that the batting side loses
+   **3 or more wickets in the next 12 legal balls**, using the runs and wickets of the **last 12 balls**
+   together with the match state.
+
+# Dataset
+
+* **Source:** Cricsheet — official/licensed ball-by-ball JSON, one file per match (<https://cricsheet.org/>).
+* **Size:** 1,169 IPL matches (≈ 2,300 innings, ≈ 280,000 deliveries).
+* **Structure:** `info` (teams, venue, season, overs) → `innings` → `overs` → `deliveries`
+  (`runs.batter`, `runs.extras`, `runs.total`, `extras.wides/noballs`, `wickets[]`).
+
+Place the JSON files (or the unzipped `ipl_json` folder) in `data/` before knitting.
+
+# Data Parsing & Cleaning
+
+Each JSON file is flattened to **one row per legal ball**. Rules applied:
+
+* only innings 1 and 2 of **20-over** matches (super overs and rain-shortened games removed);
+* wides / no-balls are folded into the legal ball they precede, so the ball counter is correct;
+* *retired hurt* is **not** a wicket;
+* for every legal ball we store score, wickets, **runs and wickets in the last 12 balls**, and
+  **wickets in the next 12 balls** (the collapse label).
+
+```{r parse}
+ipl <- parse_all_matches(params$data_dir)
+cat("Matches :", n_distinct(ipl$match_id), "\n")
+cat("Innings :", nrow(distinct(ipl, match_id, innings_num)), "\n")
+cat("Rows    :", nrow(ipl), "(one per legal ball)\n")
+glimpse(ipl)
+```
+
+```{r quality}
+# basic data-quality checks
+stopifnot(!anyNA(ipl$cum_score), !anyNA(ipl$cum_wickets))
+ipl %>% distinct(match_id, innings_num, final_score, final_wickets) %>%
+  summarise(min_score = min(final_score), max_score = max(final_score),
+            max_wkts = max(final_wickets)) %>% kable()
+```
+
+# Exploratory Data Analysis
+
+```{r eda-scores}
+innings <- ipl %>% distinct(match_id, innings_num, final_score, final_wickets)
+p1 <- ggplot(filter(innings, innings_num == 1), aes(final_score)) +
+  geom_histogram(binwidth = 10, fill = pal["green"], colour = "white") +
+  labs(title = "Distribution of first-innings totals",
+       x = "Final score", y = "Innings")
+print(p1); save_fig(p1, "fig1_score_distribution.png")
+```
+
+```{r eda-wickets}
+innings %>% filter(innings_num == 1) %>%
+  group_by(final_wickets) %>% summarise(innings = n(), mean_score = round(mean(final_score), 1)) %>%
+  kable(caption = "Mean first-innings total by wickets lost")
+```
+
+# Feature Engineering
+
+| Feature | Meaning |
+|---|---|
+| `checkpoint_overs` | 6, 10, 15 or 18 overs completed |
+| `cum_score`, `cum_wickets` | score and wickets at the checkpoint |
+| `current_run_rate` | `cum_score / overs` |
+| `runs_last12` | runs scored in the last 12 legal balls (momentum) |
+| `wkts_last12` | wickets lost in the last 12 legal balls (pressure) |
+
+```{r snapshots}
+snapshots <- ipl %>%
+  filter(innings_num == 1, ball %in% CHECKPOINT_BALLS) %>%
+  transmute(match_id, checkpoint_overs = ball / 6, cum_score, cum_wickets,
+            current_run_rate, runs_last12, wkts_last12, target = final_score)
+cat("Checkpoint snapshots:", nrow(snapshots), "\n")
+```
+
+# Train / Test Split
+
+The split is made **by match** (80 / 20) so that no match appears in both sets — this avoids
+leakage between the same innings' checkpoints.
+
+```{r split}
+set.seed(params$seed)
+all_ids   <- unique(ipl$match_id)
+train_ids <- sample(all_ids, floor(0.8 * length(all_ids)))
+train <- filter(snapshots, match_id %in% train_ids)
+test  <- filter(snapshots, !match_id %in% train_ids)
+cat("Train snapshots:", nrow(train), "| Test snapshots:", nrow(test), "\n")
+```
+
+# Model 1 — Score Forecasting
+
+Five approaches are compared: a **mean baseline**, the **naive run-rate projection**
+(`CRR × 20`), **linear regression**, **ridge regression**, **random forest** and
+**gradient boosting**.
+
+```{r reg-models}
+feats <- c("checkpoint_overs", "cum_score", "cum_wickets",
+           "current_run_rate", "runs_last12", "wkts_last12")
+fml <- as.formula(paste("target ~", paste(feats, collapse = " + ")))
+
+base_val <- mean(train$target)
+lm_fit   <- lm(fml, data = train)
+ridge_cv <- cv.glmnet(as.matrix(train[, feats]), train$target, alpha = 0)
+set.seed(params$seed)
+rf_fit   <- randomForest(fml, data = train, ntree = 300, importance = TRUE)
+set.seed(params$seed)
+gbm_fit  <- gbm(fml, data = train, distribution = "gaussian", n.trees = 800,
+                interaction.depth = 3, shrinkage = 0.03, cv.folds = 5, verbose = FALSE)
+best_trees <- gbm.perf(gbm_fit, method = "cv", plot.it = FALSE)
+
+preds <- list(
+  Baseline        = rep(base_val, nrow(test)),
+  `Run-rate x 20` = test$current_run_rate * 20,
+  Linear          = as.numeric(predict(lm_fit, test)),
+  Ridge           = as.numeric(predict(ridge_cv, as.matrix(test[, feats]), s = "lambda.min")),
+  RandomForest    = as.numeric(predict(rf_fit, test)),
+  GradientBoost   = as.numeric(predict(gbm_fit, test, n.trees = best_trees))
+)
+reg_tbl <- do.call(rbind, lapply(preds, function(p) eval_metrics(test$target, p)))
+reg_tbl <- data.frame(Model = rownames(reg_tbl), round(reg_tbl, 3), row.names = NULL)
+kable(reg_tbl, caption = "Hold-out performance of final-score forecasts (all checkpoints)")
+```
+
+```{r reg-by-checkpoint}
+best_name <- reg_tbl$Model[which.min(reg_tbl$MAE)]
+cat("Best model by MAE:", best_name, "\n")
+
+by_cp <- bind_rows(lapply(c("Run-rate x 20", best_name), function(nm) {
+  test %>% mutate(pred = preds[[nm]], model = nm) %>%
+    group_by(model, checkpoint_overs) %>%
+    summarise(MAE = mean(abs(target - pred)), .groups = "drop")
+}))
+p3 <- ggplot(by_cp, aes(factor(checkpoint_overs), MAE, fill = model)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(pal["grey"], pal["green"]) %>% setNames(c("Run-rate x 20", best_name))) +
+  labs(title = "Forecast error shrinks as the innings unfolds",
+       x = "Overs completed", y = "MAE (runs)", fill = NULL)
+print(p3); save_fig(p3, "fig3_mae_by_checkpoint.png")
+```
+
+```{r pred-actual}
+p2 <- test %>% mutate(pred = preds[[best_name]]) %>%
+  ggplot(aes(pred, target, colour = factor(checkpoint_overs))) +
+  geom_point(alpha = 0.45) + geom_abline(colour = pal["red"], linetype = 2) +
+  labs(title = paste("Predicted vs actual final score —", best_name),
+       x = "Predicted", y = "Actual", colour = "Overs")
+print(p2); save_fig(p2, "fig2_pred_vs_actual.png")
+```
+
+## What drives the forecast?
+
+```{r importance}
+imp <- as.data.frame(importance(rf_fit))
+imp$feature <- rownames(imp)
+p4 <- ggplot(imp, aes(reorder(feature, `%IncMSE`), `%IncMSE`)) +
+  geom_col(fill = pal["green"]) + coord_flip() +
+  labs(title = "Random-forest feature importance", x = NULL, y = "% increase in MSE if permuted")
+print(p4); save_fig(p4, "fig4_feature_importance.png")
+```
+
+# Model 2 — Batting-Collapse Detection
+
+**Definition:** a collapse starts at ball *b* if the batting side loses **≥ 3 wickets in the next 12 legal balls**.
+For every legal ball we know the *last-12-ball* runs and wickets (the model inputs) and the
+*next-12-ball* wickets (the label). Windows that run past an all-out innings are padded with
+"no more wickets"; windows cut short by a successful chase are dropped.
+
+```{r collapse-data}
+col_df <- ipl %>% filter(!is.na(is_collapse), ball >= 12)
+col_train <- filter(col_df, match_id %in% train_ids)
+col_test  <- filter(col_df, !match_id %in% train_ids)
+cat("Collapse base rate (test):", round(mean(col_test$is_collapse) * 100, 1), "%\n")
+
+cf <- is_collapse ~ ball + cum_score + cum_wickets + current_run_rate +
+  runs_last12 + wkts_last12 + innings_num
+```
+
+```{r collapse-models}
+lr_fit <- glm(cf, data = col_train, family = binomial)
+
+set.seed(params$seed)
+rf_sample <- col_train[sample(nrow(col_train), min(60000, nrow(col_train))), ]
+rf_cls <- randomForest(update(cf, factor(is_collapse) ~ .), data = rf_sample,
+                       ntree = 150, nodesize = 50)
+
+p_lr_tr <- predict(lr_fit, col_train, type = "response")
+p_lr    <- predict(lr_fit, col_test,  type = "response")
+p_rf_tr <- predict(rf_cls, col_train[1:min(60000, nrow(col_train)), ], type = "prob")[, 2]
+p_rf    <- predict(rf_cls, col_test, type = "prob")[, 2]
+
+thr_lr <- best_f1_threshold(col_train$is_collapse, p_lr_tr)
+thr_rf <- best_f1_threshold(col_train$is_collapse[1:length(p_rf_tr)], p_rf_tr)
+
+auc_lr <- as.numeric(auc(roc(col_test$is_collapse, p_lr, quiet = TRUE)))
+auc_rf <- as.numeric(auc(roc(col_test$is_collapse, p_rf, quiet = TRUE)))
+cm_lr  <- class_metrics(col_test$is_collapse, p_lr, thr_lr)
+cm_rf  <- class_metrics(col_test$is_collapse, p_rf, thr_rf)
+
+cls_tbl <- data.frame(
+  Model = c("Logistic regression", "Random forest"),
+  AUC = round(c(auc_lr, auc_rf), 3),
+  Threshold = c(thr_lr, thr_rf),
+  Precision = round(c(cm_lr$precision, cm_rf$precision), 3),
+  Recall = round(c(cm_lr$recall, cm_rf$recall), 3),
+  F1 = round(c(cm_lr$f1, cm_rf$f1), 3),
+  Accuracy = round(c(cm_lr$accuracy, cm_rf$accuracy), 3))
+kable(cls_tbl, caption = "Collapse detection on the hold-out matches (threshold tuned for F1 on training data)")
+```
+
+```{r roc}
+roc_df <- bind_rows(
+  { r <- roc(col_test$is_collapse, p_lr, quiet = TRUE); data.frame(fpr = 1 - r$specificities, tpr = r$sensitivities, model = "Logistic") },
+  { r <- roc(col_test$is_collapse, p_rf, quiet = TRUE); data.frame(fpr = 1 - r$specificities, tpr = r$sensitivities, model = "Random forest") })
+p5 <- ggplot(roc_df, aes(fpr, tpr, colour = model)) + geom_line(linewidth = 1) +
+  geom_abline(linetype = 2, colour = pal["grey"]) +
+  scale_colour_manual(values = c(Logistic = pal[["red"]], `Random forest` = pal[["green"]])) +
+  labs(title = "ROC curves — collapse detection", x = "False-positive rate", y = "True-positive rate", colour = NULL)
+print(p5); save_fig(p5, "fig5_roc.png")
+```
+
+```{r collapse-heat}
+heat <- col_df %>%
+  mutate(over_band = cut(ball / 6, c(0, 6, 10, 15, 20), labels = c("1-6", "7-10", "11-15", "16-20")),
+         wk_band = pmin(cum_wickets, 7)) %>%
+  group_by(over_band, wk_band) %>%
+  summarise(rate = mean(is_collapse), n = n(), .groups = "drop") %>% filter(n >= 200)
+p6 <- ggplot(heat, aes(over_band, factor(wk_band), fill = rate)) + geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 1)), colour = "white", size = 3.5) +
+  scale_fill_gradient(low = pal["green"], high = pal["red"], labels = scales::percent) +
+  labs(title = "How often does a collapse follow?", x = "Overs", y = "Wickets down (7 = 7+)", fill = "Collapse rate")
+print(p6); save_fig(p6, "fig6_collapse_heatmap.png")
+```
+
+# Live Match Simulator
+
+```{r simulate}
+sim <- function(score, wk, overs, r12, w12) {
+  snap <- data.frame(checkpoint_overs = overs, cum_score = score, cum_wickets = wk,
+                     current_run_rate = score / overs, runs_last12 = r12, wkts_last12 = w12)
+  col <- data.frame(ball = overs * 6, cum_score = score, cum_wickets = wk,
+                    current_run_rate = score / overs, runs_last12 = r12,
+                    wkts_last12 = w12, innings_num = 1)
+  cat(sprintf("%d/%d after %.0f overs | last 12 balls: %d runs, %d wkts\n", score, wk, overs, r12, w12))
+  cat("Expected final score :", round(predict(rf_fit, snap)), "\n")
+  cat("Collapse probability :", round(100 * predict(lr_fit, col, type = "response"), 1), "%\n")
+}
+sim(85, 2, 10, 15, 0)
+sim(85, 4, 10, 8, 2)
+```
+
+# Save Artifacts
+
+```{r save}
+saveRDS(rf_fit,  "models/ipl_score_rf_model.rds")
+saveRDS(gbm_fit, "models/score_gbm.rds")
+saveRDS(lr_fit,  "models/ipl_collapse_log_model.rds")
+saveRDS(list(best_trees = best_trees), "models/gbm_meta.rds")
+
+by_cp_all <- test %>% mutate(pred = preds[[best_name]]) %>%
+  group_by(checkpoint_overs) %>%
+  summarise(MAE = mean(abs(target - pred)), .groups = "drop")
+rr_cp <- test %>% mutate(pred = preds[["Run-rate x 20"]]) %>%
+  group_by(checkpoint_overs) %>% summarise(MAE = mean(abs(target - pred)), .groups = "drop")
+
+metrics <- list(
+  n_matches = n_distinct(ipl$match_id),
+  n_innings = nrow(innings),
+  n_balls   = nrow(ipl),
+  n_snapshots = nrow(snapshots),
+  best_model = best_name,
+  forecast = reg_tbl,
+  forecast_by_checkpoint = list(best = by_cp_all, run_rate = rr_cp),
+  collapse = list(
+    base_rate = mean(col_test$is_collapse),
+    logistic = c(list(auc = auc_lr, threshold = thr_lr), cm_lr),
+    random_forest = c(list(auc = auc_rf, threshold = thr_rf), cm_rf)),
+  top_features = rownames(imp)[order(-imp$`%IncMSE`)][1:3]
+)
+jsonlite::write_json(metrics, "results/metrics.json", auto_unbox = TRUE, pretty = TRUE, digits = 4)
+cat("Saved models/, figures/ and results/metrics.json\n")
+```
+
+# Conclusion
+
+* The learned models use **recent momentum** (`runs_last12`), **recent wickets** (`wkts_last12`) and **wickets in hand**,
+  which a plain run-rate × 20 projection ignores; the tables above give the exact error comparison on unseen matches.
+* Forecast error falls as more overs are completed; the 6-over forecast is inherently the least certain.
+* Collapses are rare events; accuracy alone is misleading, so **AUC, precision, recall and F1** are reported.
+* **Limitations:** no pitch/weather/batter-quality features; only first-innings totals are forecast
+  (chases end early); a random match split is used rather than a season-wise split.
+* **Future work:** add batter/bowler form and venue effects, gradient-boosted classifiers with calibration,
+  season-wise validation, and a deployed Shiny dashboard (`R/app.R`).
+
+# References
+
+* Cricsheet — ball-by-ball data: <https://cricsheet.org/downloads/>
+* Breiman, L. (2001). Random Forests. *Machine Learning* 45(1).
+* Friedman, J. (2001). Greedy function approximation: a gradient boosting machine. *Annals of Statistics*.
+* R packages: jsonlite, dplyr, ggplot2, caret, randomForest, glmnet, gbm, pROC.
+
